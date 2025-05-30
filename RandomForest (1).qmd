@@ -1,0 +1,229 @@
+# PARTE 2: Detección de fraude en las reclamaciones de seguros de vehículos
+
+### ***Paula Ibañez, María del Mar Martínez y Marta Vaquerizo.***
+
+### Resumen del proyecto
+
+En esta segunda parte, se complementa el análisis utilizando un enfoque no lineal basado en **Random Forest**, un algoritmo de aprendizaje supervisado que se basa en la construcción de múltiples árboles de decisión. A diferencia de los modelos lineales, Random Forest no asume una relación lineal entre las variables predictoras y la variable objetivo, lo que lo convierte en una herramienta poderosa para capturar patrones complejos y no evidentes en los datos.
+
+Random Forest es especialmente adecuado para problemas de detección de fraudes debido a su capacidad para manejar grandes cantidades de datos, gestionar la multicolinealidad entre las características y evitar el sobreajuste gracias a la agregación de múltiples árboles. Además, su interpretación a través de la **importancia de las características** permite identificar los factores más relevantes en las predicciones, proporcionando insights valiosos para el contexto de los seguros.
+
+Este enfoque no lineal ofrece una perspectiva complementaria, permitiendo validar los resultados obtenidos previamente y explorar nuevas oportunidades para optimizar la detección automatizada de fraudes.
+
+#### Librerías
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(caret)
+library(dplyr)
+library(randomForest)
+library(ROSE)  # Para SMOTE
+library(vip)
+```
+
+#### Cargar el Dataset
+
+```{r}
+
+data <- read.csv("C:/Users/34672/Documents/Big Data and Bussines Analytics/Minería de datos/Assigment 1/fraud_oracle.csv", 
+                 stringsAsFactors = FALSE)
+```
+
+#### Eliminación de Columnas Innecesarias
+
+```{r}
+# Mostrar las columnas originales
+print(colnames(data))
+
+# Seleccionar columnas relevantes
+data_cleaned <- data %>% 
+  select(-Month, -WeekOfMonth, -DayOfWeek, -DayOfWeekClaimed, -MonthClaimed, -WeekOfMonthClaimed, -PolicyNumber, -Age)
+
+# Mostrar las columnas después de la limpieza
+print(colnames(data_cleaned))
+
+# Convertir variables categóricas a factores
+data_final <- data_cleaned %>%
+  mutate(across(where(is.character), ~ as.factor(.)))
+```
+
+#### Aplicación de SMOTE
+
+```{r}
+set.seed(42)  # Fijar la semilla para reproducibilidad
+
+# Aplicar SMOTE para balancear la clase objetivo
+data_smote <- ROSE(FraudFound_P ~ ., data = data_final, seed = 42)
+
+# Convertir el objeto ROSE a un data.frame
+data_smote_df <- data_smote$data
+```
+
+#### Separación de Variables Independientes y Dependientes
+
+```{r}
+# Variables independientes
+X <- data_smote_df %>% select(-FraudFound_P)  
+
+# Variable dependiente
+y <- data_smote_df$FraudFound_P              
+```
+
+#### División en Training y Test
+
+```{r}
+# Dividir los datos en entrenamiento y prueba
+train_index <- createDataPartition(y, p = 0.7, list = FALSE)
+
+X_train <- X[train_index, ]  # Características de entrenamiento
+X_test <- X[-train_index, ]  # Características de prueba
+y_train <- y[train_index]    # Etiquetas de entrenamiento
+y_test <- y[-train_index]    # Etiquetas de prueba
+
+# Crear el conjunto de entrenamiento
+training_data <- X_train %>%
+  mutate(FraudFound_P = as.factor(y_train))
+```
+
+#### Modelado con Random Forest y Tuneo de Hiperparámetros
+
+```{r}
+set.seed(42)  # Fijamos semilla para reproducibilidad
+
+# Definimos el modelo de Random Forest con hiperparámetros tuneables
+rf_model_tune <- rand_forest(
+  mode = "classification",
+  trees = tune(),
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_engine("randomForest")
+
+# Crear el flujo de trabajo
+rf_workflow_tune <- workflow() %>%
+  add_formula(FraudFound_P ~ .) %>%
+  add_model(rf_model_tune)
+
+# Definir el grid de hiperparámetros
+rf_grid <- grid_regular(
+  mtry(range = c(5, 15)),
+  trees(range = c(500, 1000)),
+  min_n(range = c(20, 50)),
+  levels = c(5, 2, 3)
+)
+
+# Validación cruzada
+cv_folds <- vfold_cv(training_data, v = 5, strata = FraudFound_P)
+
+# Ajuste del modelo con tune_grid()
+rf_tuned_results <- tune_grid(
+  rf_workflow_tune,
+  resamples = cv_folds,
+  grid = rf_grid,
+  metrics = metric_set(roc_auc)
+)
+
+# Seleccionar los mejores hiperparámetros
+best_params <- select_best(rf_tuned_results, metric = "roc_auc")
+
+# Crear el flujo de trabajo final
+final_rf_workflow <- finalize_workflow(rf_workflow_tune, best_params)
+
+# Ajustar el modelo final
+final_rf_fit <- final_rf_workflow %>%
+  fit(data = training_data)
+
+# Mostrar el modelo ajustado
+print(final_rf_fit)
+```
+
+#### Importancia de las Características
+
+```{r}
+# Extraer el modelo ajustado
+rf_model_fitted <- extract_fit_engine(final_rf_fit)
+
+# Visualizar la importancia de las características
+vip_plot <- vip(
+  rf_model_fitted,
+  num_features = 10,
+  geom = "col"
+)
+
+print(vip_plot)
+```
+
+La gráfica muestra que las características más relevantes para detectar posibles fraudes en los seguros de automóviles son aquellas relacionadas directamente con las condiciones del accidente y las características de la póliza. En particular:
+
+-   **"Fault"** es el factor más influyente, lo que sugiere que determinar la responsabilidad del asegurado en el accidente es clave para identificar casos sospechosos.
+-   **"PolicyType"** y **"Deductible"** también destacan como variables importantes, lo que indica que ciertos tipos de pólizas y deducibles están asociados con un mayor riesgo de fraude.
+-   Otras variables como **"BasePolicy"**, **"Year"** y **"Make"** tienen una influencia intermedia, proporcionando contexto adicional pero con menor impacto directo.
+-   Finalmente, características como **"VehicleCategory"** y **"AgeOfPolicyHolder"** tienen menor relevancia en el modelo, lo que sugiere que su contribución a la detección de fraudes es limitada.
+
+Estas observaciones refuerzan la idea de que las características más cercanas al accidente y a la póliza son las más útiles para optimizar el sistema de detección automatizada, reduciendo la dependencia de evaluaciones manuales.
+
+#### Predicciones y Evaluación del Modelo
+
+```{r}
+# Crear el conjunto de prueba
+test_data <- X_test %>%
+  mutate(FraudFound_P = as.factor(y_test))
+
+# Realizar predicciones
+predictions <- predict(final_rf_fit, new_data = test_data)
+
+# Agregar probabilidades de predicción
+predictions_prob <- predict(final_rf_fit, new_data = test_data, type = "prob")
+
+# Combinar predicciones con etiquetas reales
+results <- test_data %>%
+  select(FraudFound_P) %>%
+  mutate(
+    predicted = predictions$.pred_class,
+    prob_fraud = predictions_prob$.pred_1
+  )
+
+# Matriz de confusión
+conf_matrix <- results %>%
+  conf_mat(truth = FraudFound_P, estimate = predicted)
+
+print(conf_matrix)
+autoplot(conf_matrix)
+
+# Métricas de rendimiento con yardstick
+metricas <- metric_set(accuracy, f_meas)
+metrics_results <- metricas(results, truth = FraudFound_P, estimate = predicted)
+
+print(metrics_results)
+```
+
+-   Verdaderos negativos: El modelo identificó correctamente **1721 casos** como no fraudulentos (clase 0). Esto indica un buen desempeño al evitar marcar falsamente reclamos legítimos como fraudulentos.
+
+-   Falsos negativos : **101 casos fraudulentos** (clase 1) no fueron detectados por el modelo y se clasificaron incorrectamente como no fraudulentos. Estos casos representan un riesgo para la aseguradora, ya que los fraudes no detectados podrían generar pérdidas económicas.
+
+-   Verdaderos positivos:El modelo detectó correctamente **2223 casos fraudulentos**, lo que muestra que identifica de forma efectiva la mayoría de los reclamos sospechosos.
+
+-   Falsos positivos (581): **581 casos legítimos** fueron clasificados erróneamente como fraudulentos. Aunque esto puede implicar costos adicionales para revisar estos reclamos, es preferible a no detectar fraudes reales.
+
+Métricas derivadas:
+
+1.  **Precisión en detectar fraudes (clase 1):** El modelo muestra una capacidad alta para identificar fraudes, pero aún queda margen para reducir los falsos negativos.
+
+2.  **Impacto de los falsos positivos:** Aunque existen errores al clasificar casos legítimos como fraudulentos, estos pueden mitigarse mediante una revisión manual más eficiente.
+
+3.  **Balance entre errores:** El modelo prioriza la detección de fraudes, lo cual es adecuado en este contexto, aunque el costo de los falsos positivos debe ser considerado en el proceso operativo.
+
+### Conclusiones de la evaluación del modelo:
+
+La precisión del modelo es de **85.26%**, lo que indica que el modelo clasifica correctamente un alto porcentaje de los casos (fraudulentos y no fraudulentos). Este resultado es sólido para una tarea de clasificación binaria, especialmente en un problema como la detección de fraudes, donde los datos suelen estar desbalanceados.
+
+El F1 Score obtenido es de **83.46%**, lo que refleja un buen equilibrio entre la **precisión** (proporción de predicciones correctas entre las predicciones positivas) y la **recall** (proporción de casos positivos identificados correctamente). Este valor es importante en contextos como este, donde tanto los falsos positivos como los falsos negativos tienen implicaciones significativas.
+
+-   **Buen desempeño general:**\
+    Ambas métricas muestran que el modelo es efectivo en la detección de fraudes, clasificando correctamente la mayoría de los casos y manejando adecuadamente el balance entre precisión y recall.
+
+-   **Posibilidad de mejora:**\
+    Aunque los resultados son buenos, un análisis más profundo podría identificar formas de optimizar aún más el modelo, especialmente para reducir falsos negativos (que representan fraudes no detectados).
+
+### 
